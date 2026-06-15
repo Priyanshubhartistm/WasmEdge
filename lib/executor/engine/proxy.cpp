@@ -2,9 +2,13 @@
 // SPDX-FileCopyrightText: 2019-2024 Second State INC
 
 #include "executor/executor.h"
+#include "runtime/instance/array.h"
+#include "runtime/instance/gc.h"
 #include "system/fault.h"
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace WasmEdge {
 namespace Executor {
@@ -108,6 +112,7 @@ const Executable::IntrinsicsTable Executor::Intrinsics = {
     ENTRY(kTableGetFuncSymbol, proxyTableGetFuncSymbol),
     ENTRY(kRefGetFuncSymbol, proxyRefGetFuncSymbol),
     ENTRY(kFuncGetFuncSymbol, proxyFuncGetFuncSymbol),
+    ENTRY(kGlobalSet, proxyGlobalSet),
 #undef ENTRY
 };
 
@@ -140,9 +145,7 @@ Expect<void> Executor::proxyCall(Runtime::StackManager &StackMgr,
   EXPECTED_TRY(auto StartIt, enterFunction(StackMgr, *FuncInst, Instrs.end()));
   EXPECTED_TRY(execute(StackMgr, StartIt, Instrs.end()));
 
-  for (uint32_t I = 0; I < ReturnsSize; ++I) {
-    Rets[ReturnsSize - 1 - I] = StackMgr.pop();
-  }
+  StackMgr.popSpan(Span<ValVariant>(Rets, ReturnsSize));
   return {};
 }
 
@@ -203,9 +206,7 @@ Expect<void> Executor::proxyCallIndirect(Runtime::StackManager &StackMgr,
   EXPECTED_TRY(auto StartIt, enterFunction(StackMgr, *FuncInst, Instrs.end()));
   EXPECTED_TRY(execute(StackMgr, StartIt, Instrs.end()));
 
-  for (uint32_t I = 0; I < ReturnsSize; ++I) {
-    Rets[ReturnsSize - 1 - I] = StackMgr.pop();
-  }
+  StackMgr.popSpan(Span<ValVariant>(Rets, ReturnsSize));
   return {};
 }
 
@@ -234,10 +235,7 @@ Expect<void> Executor::proxyCallRef(Runtime::StackManager &StackMgr,
   EXPECTED_TRY(auto StartIt, enterFunction(StackMgr, *FuncInst, Instrs.end()));
   EXPECTED_TRY(execute(StackMgr, StartIt, Instrs.end()));
 
-  for (uint32_t I = 0; I < ReturnsSize; ++I) {
-    Rets[ReturnsSize - 1 - I] = StackMgr.pop();
-  }
-
+  StackMgr.popSpan(Span<ValVariant>(Rets, ReturnsSize));
   return {};
 }
 
@@ -252,6 +250,7 @@ Expect<RefVariant> Executor::proxyStructNew(Runtime::StackManager &StackMgr,
                                             const uint32_t TypeIdx,
                                             const ValVariant *Args,
                                             const uint32_t ArgSize) noexcept {
+  Allocator.autoCollect(true);
   if (Args == nullptr) {
     return structNew(StackMgr, TypeIdx);
   } else {
@@ -282,6 +281,7 @@ Expect<RefVariant> Executor::proxyArrayNew(Runtime::StackManager &StackMgr,
                                            const uint32_t Length,
                                            const ValVariant *Args,
                                            const uint32_t ArgSize) noexcept {
+  Allocator.autoCollect(true);
   assuming(ArgSize == 0 || ArgSize == 1 || ArgSize == Length);
   if (ArgSize == 0) {
     return arrayNew(StackMgr, TypeIdx, Length);
@@ -298,6 +298,7 @@ Expect<RefVariant> Executor::proxyArrayNewData(Runtime::StackManager &StackMgr,
                                                const uint32_t DataIdx,
                                                const uint32_t Start,
                                                const uint32_t Length) noexcept {
+  Allocator.autoCollect(true);
   return arrayNewData(StackMgr, TypeIdx, DataIdx, Start, Length);
 }
 
@@ -306,6 +307,7 @@ Expect<RefVariant> Executor::proxyArrayNewElem(Runtime::StackManager &StackMgr,
                                                const uint32_t ElemIdx,
                                                const uint32_t Start,
                                                const uint32_t Length) noexcept {
+  Allocator.autoCollect(true);
   return arrayNewElem(StackMgr, TypeIdx, ElemIdx, Start, Length);
 }
 
@@ -328,11 +330,12 @@ Expect<void> Executor::proxyArraySet(Runtime::StackManager &StackMgr,
 
 Expect<uint32_t> Executor::proxyArrayLen(Runtime::StackManager &,
                                          const RefVariant Ref) noexcept {
-  auto *Inst = Ref.getPtr<Runtime::Instance::ArrayInstance>();
-  if (Inst == nullptr) {
+  auto *Raw = Ref.getPtr<Runtime::Instance::GCInstance::RawData>();
+  if (Raw == nullptr) {
     return Unexpect(ErrCode::Value::AccessNullArray);
   }
-  return Inst->getLength();
+  const Runtime::Instance::ArrayInstance Inst{Raw};
+  return Inst.getLength();
 }
 
 Expect<void> Executor::proxyArrayFill(Runtime::StackManager &StackMgr,
@@ -379,11 +382,14 @@ Expect<uint32_t> Executor::proxyRefTest(Runtime::StackManager &StackMgr,
   assuming(ModInst);
   Span<const AST::SubType *const> GotTypeList = ModInst->getTypeList();
   if (!VT.isAbsHeapType()) {
-    auto *Inst = Ref.getPtr<Runtime::Instance::CompositeBase>();
-    // Reference must not be nullptr here because the null references are typed
-    // with the least abstract heap type.
-    if (Inst->getModule()) {
-      GotTypeList = Inst->getModule()->getTypeList();
+    // Resolve the defining module of this concrete-typed reference from the
+    // leading `const ModuleInstance *` of its payload (see getInnerPtr). Null
+    // references carry the least abstract heap type, so the payload is
+    // non-null.
+    const auto *RefMod =
+        Ref.getInnerPtr<const Runtime::Instance::ModuleInstance>();
+    if (RefMod) {
+      GotTypeList = RefMod->getTypeList();
     }
   }
 
@@ -407,11 +413,14 @@ Expect<RefVariant> Executor::proxyRefCast(Runtime::StackManager &StackMgr,
   assuming(ModInst);
   Span<const AST::SubType *const> GotTypeList = ModInst->getTypeList();
   if (!VT.isAbsHeapType()) {
-    auto *Inst = Ref.getPtr<Runtime::Instance::CompositeBase>();
-    // Reference must not be nullptr here because the null references are typed
-    // with the least abstract heap type.
-    if (Inst->getModule()) {
-      GotTypeList = Inst->getModule()->getTypeList();
+    // Resolve the defining module of this concrete-typed reference from the
+    // leading `const ModuleInstance *` of its payload (see getInnerPtr). Null
+    // references carry the least abstract heap type, so the payload is
+    // non-null.
+    const auto *RefMod =
+        Ref.getInnerPtr<const Runtime::Instance::ModuleInstance>();
+    if (RefMod) {
+      GotTypeList = RefMod->getTypeList();
     }
   }
 
@@ -455,7 +464,9 @@ Expect<void> Executor::proxyTableInit(Runtime::StackManager &StackMgr,
   assuming(TabInst);
   auto *ElemInst = getElemInstByIdx(StackMgr, ElemIdx);
   assuming(ElemInst);
-  return TabInst->setRefs(ElemInst->getRefs(), DstOff, SrcOff, Len);
+
+  EXPECTED_TRY(auto Refs, ElemInst->getRefs(SrcOff, Len));
+  return TabInst->setRefs(Refs, DstOff);
 }
 
 Expect<void> Executor::proxyElemDrop(Runtime::StackManager &StackMgr,
@@ -477,8 +488,8 @@ Expect<void> Executor::proxyTableCopy(Runtime::StackManager &StackMgr,
   auto *TabInstSrc = getTabInstByIdx(StackMgr, TableIdxSrc);
   assuming(TabInstSrc);
 
-  EXPECTED_TRY(auto Refs, TabInstSrc->getRefs(0, SrcOff + Len));
-  return TabInstDst->setRefs(Refs, DstOff, SrcOff, Len);
+  EXPECTED_TRY(auto Refs, TabInstSrc->getRefs(SrcOff, Len));
+  return TabInstDst->setRefs(Refs, DstOff);
 }
 
 Expect<uint64_t> Executor::proxyTableGrow(Runtime::StackManager &StackMgr,
@@ -690,6 +701,20 @@ Executor::proxyFuncGetFuncSymbol(Runtime::StackManager &StackMgr,
     return nullptr;
   }
   return FuncInst->getSymbol().get();
+}
+
+Expect<void> Executor::proxyGlobalSet(Runtime::StackManager &StackMgr,
+                                      const uint32_t GlobalIdx,
+                                      const ValVariant *Val) noexcept {
+  // Compiled global.set for a reference-typed global routes through here
+  // instead of storing through the raw getAddress() pointer, so the GC write
+  // barrier in setValue() runs (shading both the overwritten and the stored
+  // reference). A direct store would bypass the barrier and let a concurrent
+  // collection miss an object reachable only through this global.
+  auto *GlobInst = getGlobInstByIdx(StackMgr, GlobalIdx);
+  assuming(GlobInst);
+  GlobInst->setValue(*Val);
+  return {};
 }
 
 } // namespace Executor

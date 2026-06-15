@@ -221,6 +221,14 @@ public:
            Inner.Data.Externalize;
   }
 
+  // Struct/array references are the GC heap types the runtime retains as host
+  // roots; keep this predicate in one place so the retention/release check
+  // stays in sync across the executor and the C API.
+  bool isGCRefType() const noexcept {
+    return (Inner.Data.HTCode == TypeCode::StructRef) ||
+           (Inner.Data.HTCode == TypeCode::ArrayRef);
+  }
+
   bool isNullableRefType() const noexcept {
     return (Inner.Data.Code == TypeCode::RefNull);
   }
@@ -356,7 +364,7 @@ private:
 
 // >>>>>>>> Value definitions >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 
-/// FuncRef definition.
+/// Forward declarations for the reference instance types.
 namespace Runtime::Instance {
 class FunctionInstance;
 class StructInstance;
@@ -381,12 +389,11 @@ struct RefVariant {
   RefVariant(const Runtime::Instance::FunctionInstance *P) noexcept {
     setData(TypeCode::FuncRef, reinterpret_cast<const void *>(P));
   }
-  RefVariant(const Runtime::Instance::StructInstance *P) noexcept {
-    setData(TypeCode::StructRef, reinterpret_cast<const void *>(P));
-  }
-  RefVariant(const Runtime::Instance::ArrayInstance *P) noexcept {
-    setData(TypeCode::ArrayRef, reinterpret_cast<const void *>(P));
-  }
+  // Struct and array instances must be constructed with their concrete
+  // (ValType, ptr) heap type; the catch-all above would silently mis-tag
+  // them as ExternRef, so reject those pointer types at compile time.
+  RefVariant(const Runtime::Instance::StructInstance *) = delete;
+  RefVariant(const Runtime::Instance::ArrayInstance *) = delete;
 
   // Getter for type.
   const ValType &getType() const noexcept {
@@ -399,6 +406,19 @@ struct RefVariant {
   // Getter for pointer.
   template <typename T> T *getPtr() const noexcept {
     return reinterpret_cast<T *>(toArray()[1]);
+  }
+
+  // Getter for the pointer stored at the front of the referenced object. A
+  // concrete-typed ref points at a GC struct/array (GCInstance::RawData) or a
+  // typed function reference (CompositeBase / FunctionInstance); all begin with
+  // their defining `const ModuleInstance *`. Reading that leading word with
+  // memcpy avoids the type-punning UB of reinterpret_cast-ing the payload to
+  // one concrete type when it may be the other. The reference must be non-null.
+  template <typename T> T *getInnerPtr() const noexcept {
+    assuming(getPtr<void>() != nullptr);
+    T *Ptr = nullptr;
+    std::memcpy(&Ptr, getPtr<void>(), sizeof(Ptr));
+    return Ptr;
   }
 
   // Check whether it is null.

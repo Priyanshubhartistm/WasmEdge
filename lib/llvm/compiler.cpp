@@ -219,6 +219,10 @@ struct LLVM::Compiler::CompileContext {
   std::vector<LLVM::Type> MemoryAddrTypes;
   std::vector<LLVM::Type> TableAddrTypes;
   std::vector<LLVM::Type> Globals;
+  // Parallel to Globals: whether each global holds a reference type. A
+  // reference-typed global.set must run the GC write barrier, so its store is
+  // routed through the kGlobalSet intrinsic instead of a direct memory store.
+  std::vector<bool> GlobalIsRef;
   LLVM::Value IntrinsicsTable;
   LLVM::FunctionCallee Trap;
   CompileContext(LLVM::Context C, LLVM::Module &M,
@@ -1531,9 +1535,27 @@ public:
         break;
       }
       case OpCode::Global__set:
-        Builder.createStore(
-            stackPop(),
-            Context.getGlobal(Builder, ExecCtx, Instr.getTargetIndex()).second);
+        if (Context.GlobalIsRef[Instr.getTargetIndex()]) {
+          // Reference-typed global: route through the kGlobalSet intrinsic so
+          // the GC write barrier runs. A direct store would bypass it and let a
+          // concurrent collection miss the newly stored reference.
+          auto Val = stackPop();
+          LLVM::Value Arg = Builder.createAlloca(Context.Int64x2Ty);
+          Builder.createValuePtrStore(Val, Arg, Context.Int64x2Ty);
+          Builder.createCall(
+              Context.getIntrinsic(Builder, Executable::Intrinsics::kGlobalSet,
+                                   LLVM::Type::getFunctionType(
+                                       Context.VoidTy,
+                                       {Context.Int32Ty, Context.Int8PtrTy},
+                                       false)),
+              {LLContext.getInt32(Instr.getTargetIndex()), Arg});
+        } else {
+          // Numeric global: never holds a managed reference, so store directly.
+          Builder.createStore(
+              stackPop(),
+              Context.getGlobal(Builder, ExecCtx, Instr.getTargetIndex())
+                  .second);
+        }
         break;
 
       // Table Instructions
@@ -6397,6 +6419,7 @@ void Compiler::compile(const AST::ImportSection &ImportSec) noexcept {
       const auto &ValType = GlobType.getValType();
       auto Type = toLLVMType(Context->LLContext, ValType);
       Context->Globals.push_back(Type);
+      Context->GlobalIsRef.push_back(ValType.isRefType());
       break;
     }
     case ExternalType::Tag: // Tag type
@@ -6417,6 +6440,7 @@ void Compiler::compile(const AST::GlobalSection &GlobalSec) noexcept {
     const auto &ValType = GlobalSeg.getGlobalType().getValType();
     auto Type = toLLVMType(Context->LLContext, ValType);
     Context->Globals.push_back(Type);
+    Context->GlobalIsRef.push_back(ValType.isRefType());
   }
 }
 
